@@ -7,9 +7,16 @@ function Pool(options){
     this.config = options.config;
     this.config.connectionConfig.pool = this;
 
+    // Connections currently in using
     this._acquiringConnections = [];
+
+    // All connections the pool having
     this._allConnections = [];
+
+    // All freeing connections for using
     this._freeConnections = [];
+
+
     this._connectionQueue = [];
     this._closed = false;
 }
@@ -41,7 +48,7 @@ Pool.prototype.getConnection = function (cb){
         this._allConnections.push(connection);
 
         connection.connect(function(err, conn){
-            spliceConnection(pool._acquiringConnections, conn);
+            spliceConnection(pool._acquiringConnections, connection);
 
             if (pool._closed){
                 err = new Error('Pool is closed');
@@ -55,6 +62,7 @@ Pool.prototype.getConnection = function (cb){
             }
             pool.emit('connection', connection);
             pool.emit('acquire', connection);
+            cb(null, conn);
         });
         return;
     }
@@ -77,40 +85,59 @@ Pool.prototype.acquireConnection = function acquireConnection(connection, cb) {
         throw new Error('Connection acquired from wrong pool.');
     }
 
-    var changeUser = this._needsChangeUser(connection);
+    //var changeUser = this._needsChangeUser(connection);
     var pool = this;
+    var err = null;
+    if (pool._closed){
+        err = new Error('Pool is closed');
+        err.code = 'POOL_CLOSED';
+    }
 
-    this._acquiringConnections.push(connection);
-    function onOperationComplete(err) {
-        spliceConnection(pool._acquiringConnections, connection);
-        if (pool._closed){
-            err = new Error('Pool is closed');
-            err.code = 'POOL_CLOSED';
-        }
-
-        if (err){
-            pool._connectionQueue.unshift(cb);
-            pool._pureConnection(connection);
-            return;
-        }
-
-        if (changeUser){
-            pool.emit('connection', connection);
-        }
-
-        pool.emit('acquire', connection);
-        cb(null, connection);
+    if (err){
+        pool._connectionQueue.unshift(cb);
+        pool._pureConnection(connection);
+        cb(err);
+        return;
     }
 
     if (changeUser){
-        // restore user back to pool configuration
-        connection.config = this.config.newConnectionConfig();
-        connection.changeUser({timeout: this.config.acquireTimeout}, onOperationComplete);
+        pool.emit('connection', connection);
     }
-    else{
-        //ping connection
-        connection.ping({timeout: this.config.acquireTimeout}, onOperationComplete);
-    }
+
+    pool.emit('acquire', connection);
+    cb(null, connection);
+
+    // this._acquiringConnections.push(connection);
+    // function onOperationComplete(err) {
+    //     spliceConnection(pool._acquiringConnections, connection);
+    //     if (pool._closed){
+    //         err = new Error('Pool is closed');
+    //         err.code = 'POOL_CLOSED';
+    //     }
+    //
+    //     if (err){
+    //         pool._connectionQueue.unshift(cb);
+    //         pool._pureConnection(connection);
+    //         return;
+    //     }
+    //
+    //     if (changeUser){
+    //         pool.emit('connection', connection);
+    //     }
+    //
+    //     pool.emit('acquire', connection);
+    //     cb(null, connection);
+    // }
+    //
+    // if (changeUser){
+    //     // restore user back to pool configuration
+    //     connection.config = this.config.newConnectionConfig();
+    //     connection.changeUser({timeout: this.config.acquireTimeout}, onOperationComplete);
+    // }
+    // else{
+    //     //ping connection
+    //     connection.ping({timeout: this.config.acquireTimeout}, onOperationComplete);
+    // }
 };
 
 Pool.prototype.releaseConnection = function releaseConnection(connection){
@@ -179,6 +206,35 @@ Pool.prototype.end = function (cb) {
     if (waitingClose === 0){
         process.nextTick(onEnd);
     }
+}
+
+Pool.prototype._enqueueCallback = function _enqueueCallback(callback){
+    if (this.config.queueLimit && this._connectionQueue.length >= this.config.queueLimit){
+        process.nextTick(function(){
+            var err = new Error('Queue limit reached.');
+            err.code = 'POOL_ENQUEUELIMIT';
+            callback(err);
+        });
+        return;
+    }
+
+    // Bind to domain, as dequeue will likely occur in a different domain
+    var cb = process.domain? process.domain.bind(callback):callback;
+
+    this._connectionQueue.push(cb);
+    this.emit('enqueue');
+}
+
+Pool.prototype._removeConnection = function(connection){
+    connection._pool = null;
+
+    // Remove connection from allConnections array
+    spliceConnection(this._allConnections, connection);
+
+    // Remove connection from freeConnections array
+    spliceConnection(this._freeConnections, connection);
+
+    this.releaseConnection(connection);
 }
 
 
